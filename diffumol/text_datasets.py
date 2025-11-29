@@ -12,16 +12,17 @@ import pandas as pd
 import re
 
 def load_data_text(
-    batch_size, 
-    seq_len, 
+    batch_size,
+    seq_len,
     data=None,
-    deterministic=False, 
-    data_args=None, 
+    deterministic=False,
+    data_args=None,
     model_emb=None,
-    split='train', 
+    split='train',
     loaded_vocab=None,
     loop=True,
     graph_embeddings=None, # Add
+    fingerprints=None,  # Add: 预计算的分子指纹
 ):
     """
     For a dataset, create a generator over (seqs, kwargs) pairs.
@@ -37,6 +38,7 @@ def load_data_text(
     :param model_emb: loaded word embeddings.
     :param loaded_vocab: loaded word vocabs.
     :param loop: loop to get batch data or not.
+    :param fingerprints: precomputed molecular fingerprints (ECFP).
     """
 
     print('#'*30, '\nLoading text data...')
@@ -48,6 +50,7 @@ def load_data_text(
         data_args,
         model_emb=model_emb,
         graph_embeddings = graph_embeddings,  # Pass in precomputed graph embeddings
+        fingerprints=fingerprints,  # Pass in precomputed fingerprints
     )
 
     if split != 'test':
@@ -204,7 +207,7 @@ def get_corpus(data_args, seq_len, split='train', loaded_vocab=None):
 
 
 class TextDataset(Dataset):
-    def __init__(self, text_datasets, data_args, model_emb=None, graph_embeddings=None):
+    def __init__(self, text_datasets, data_args, model_emb=None, graph_embeddings=None, fingerprints=None):
         super().__init__()
         self.text_datasets = text_datasets
         self.length = len(self.text_datasets['train'])
@@ -213,6 +216,9 @@ class TextDataset(Dataset):
         # Add
         self.graph_embeddings = graph_embeddings
         self.use_graph = graph_embeddings is not None
+        # Add: 分子指纹
+        self.fingerprints = fingerprints
+        self.use_fingerprint = fingerprints is not None
         
 
     def __len__(self):
@@ -226,14 +232,17 @@ class TextDataset(Dataset):
             tmp[:5]=0
             hidden_state = self.model_emb(tmp)
 
-            arr = np.array(hidden_state, dtype=np.float32) 
+            arr = np.array(hidden_state, dtype=np.float32)
             out_kwargs = {}
             out_kwargs['input_ids'] = np.array(self.text_datasets['train'][idx]['input_ids'])
             out_kwargs['input_mask'] = np.array(self.text_datasets['train'][idx]['input_mask'])
             # Add
             if self.use_graph:
                 out_kwargs['graph_idx'] = idx
-            
+            # Add: 分子指纹
+            if self.use_fingerprint:
+                out_kwargs['fp_emb'] = self.fingerprints[idx]
+
             return arr, out_kwargs
 
 def _collate_batch_helper(examples, pad_token_id, max_length, return_mask=False):

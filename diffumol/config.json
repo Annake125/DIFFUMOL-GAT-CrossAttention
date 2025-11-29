@@ -43,5 +43,8 @@
   "emb_scale_factor": 1.0,
   "use_graph": true,
   "graph_embed_dim": 128,
-  "graph_embed_path": "./hg_embed.pt"
+  "graph_embed_path": "./hg_embed.pt",
+  "use_fingerprint": false,
+  "fp_dim": 2048,
+  "fingerprint_path": "./fingerprints.npy"
 }

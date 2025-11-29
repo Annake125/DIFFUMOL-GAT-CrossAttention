@@ -366,7 +366,7 @@ class TrainLoop:
         logger.logkv("samples", (self.step + self.resume_step + 1) * self.global_batch)
         if self.use_fp16:
             logger.logkv("lg_loss_scale", self.lg_loss_scale)
-        # ====== 新增：监控图融合温度 ======
+        # ====== 新增：监控图融合温度和指纹融合权重 ======
         if self.step % 2000 == 0:
             model = self.ddp_model.module if self.use_ddp else self.ddp_model
             if hasattr(model, 'graph_fusion'):
@@ -374,6 +374,26 @@ class TrainLoop:
                 logger.logkv("graph_fusion_temp", temp)
                 if dist.get_rank() == 0:
                     print(f"[Step {self.step}] Graph fusion temperature: {temp:.4f}")
+
+            # 监控指纹融合温度
+            if hasattr(model, 'fp_fusion'):
+                fp_temp = model.fp_fusion.temperature.item()
+                logger.logkv("fp_fusion_temp", fp_temp)
+                if dist.get_rank() == 0:
+                    print(f"[Step {self.step}] Fingerprint fusion temperature: {fp_temp:.4f}")
+
+            # 监控融合权重
+            if hasattr(model, 'fusion_weights'):
+                weights = model.fusion_weights.abs().detach().cpu().numpy()
+                if len(weights) == 2:
+                    logger.logkv("fusion_weight_graph", weights[0])
+                    logger.logkv("fusion_weight_fp", weights[1])
+                    if dist.get_rank() == 0:
+                        print(f"[Step {self.step}] Fusion weights - Graph: {weights[0]:.4f}, Fingerprint: {weights[1]:.4f}")
+                elif len(weights) == 1:
+                    logger.logkv("fusion_weight", weights[0])
+                    if dist.get_rank() == 0:
+                        print(f"[Step {self.step}] Fusion weight: {weights[0]:.4f}")
         # ========================================        
         current_step = self.step + self.resume_step
         

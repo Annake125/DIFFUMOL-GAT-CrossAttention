@@ -47,6 +47,16 @@ def main():
         logger.log(f"### Loading graph embeddings from {args.graph_embed_path}")
         graph_embeddings = torch.load(args.graph_embed_path)
         logger.log(f"### Loaded graph embeddings with shape {graph_embeddings.shape}")
+
+    # Add: Load molecular fingerprints (ECFP)
+    fingerprints = None
+    if args.use_fingerprint:
+        logger.log(f"### Loading molecular fingerprints from {args.fingerprint_path}")
+        fingerprints = np.load(args.fingerprint_path)
+        logger.log(f"### Loaded fingerprints with shape {fingerprints.shape}")
+        # 转换为tensor
+        fingerprints = torch.from_numpy(fingerprints).float()
+
     tokenizer = load_tokenizer(args) 
     model_weight, tokenizer= load_model_emb(args, tokenizer) 
     
@@ -104,10 +114,11 @@ def main():
         data=train_data,
         data_args = args,
         loaded_vocab=tokenizer,
-        model_emb=model_weight, 
+        model_emb=model_weight,
         graph_embeddings=graph_embeddings, # Pass in graph embeddings
+        fingerprints=fingerprints,  # Pass in molecular fingerprints
     )
-    
+
     data_valid = load_data_text(
         batch_size=args.batch_size,
         seq_len=args.seq_len,
@@ -116,8 +127,9 @@ def main():
         split='valid',
         deterministic=True,
         loaded_vocab=tokenizer,
-        model_emb=model_weight, 
+        model_emb=model_weight,
         graph_embeddings=graph_embeddings, # Pass in graph embeddings
+        fingerprints=fingerprints,  # Pass in molecular fingerprints
     )
 
     print('#'*30, 'size of vocab', args.vocab_size)

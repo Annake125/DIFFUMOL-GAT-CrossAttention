@@ -61,6 +61,67 @@ class GraphCrossAttention(nn.Module):
         
         return out
 
+# ============== 新增：分子指纹融合模块 ==============
+class FingerprintCrossAttention(nn.Module):
+    """
+    轻量级跨注意力融合分子指纹（ECFP/Morgan）
+    参数量：~7000 (极轻量设计)
+
+    设计思路：
+    - 指纹是预计算的固定向量(2048D)，无需反向传播
+    - 通过降维MLP投影到hidden_dim
+    - 使用Cross-Attention融合到文本嵌入
+    """
+    def __init__(self, hidden_dim, fp_dim=2048, num_heads=2):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        # 轻量级降维投影（2048 -> hidden_dim）
+        # 使用两层MLP提取指纹特征
+        self.fp_proj = nn.Sequential(
+            nn.Linear(fp_dim, hidden_dim // 2, bias=False),
+            nn.ReLU(),
+            nn.Dropout(0.1),  # 防止过拟合
+            nn.Linear(hidden_dim // 2, hidden_dim, bias=False)
+        )
+
+        # Query投影（从文本嵌入）
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.scale = self.head_dim ** -0.5
+
+        # 可学习的温度参数（控制融合强度）
+        self.temperature = nn.Parameter(torch.ones(1) * 0.5)
+
+    def forward(self, text_emb, fp_emb):
+        """
+        text_emb: [B, L, D] - 文本嵌入
+        fp_emb: [B, fp_dim] - 预计算的分子指纹（ECFP）
+        返回: [B, L, D] - 指纹信息增强的文本嵌入
+        """
+        B, L, D = text_emb.shape
+
+        # 投影指纹到相同维度
+        f = self.fp_proj(fp_emb).unsqueeze(1)  # [B, 1, D]
+
+        # Query from text, Key/Value from fingerprint
+        q = self.q_proj(text_emb)  # [B, L, D]
+
+        # Multi-head attention
+        q = q.reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = f.reshape(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = k
+
+        # Scaled dot-product attention with temperature
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, heads, L, 1]
+        attn = torch.softmax(attn / self.temperature.clamp(min=0.01), dim=-1)
+
+        # Weighted fingerprint information
+        out = (attn @ v).transpose(1, 2).reshape(B, L, D)
+
+        return out
+
 # ============== 主模型修改 ==============
 class TransformerNetModel(nn.Module):
     """
@@ -112,7 +173,27 @@ class TransformerNetModel(nn.Module):
                 graph_embed_dim=graph_embed_dim,
                 num_heads=2  # 只用2个头，足够且轻量
             )
-        
+
+        # ====== 新增：分子指纹融合模块 ======
+        self.use_fingerprint = kwargs.get("use_fingerprint", False)
+        if self.use_fingerprint:
+            fp_dim = kwargs.get("fp_dim", 2048)  # ECFP默认维度
+            # 轻量级Cross-Attention融合指纹信息
+            self.fp_fusion = FingerprintCrossAttention(
+                hidden_dim=config.hidden_size,
+                fp_dim=fp_dim,
+                num_heads=2  # 与图融合保持一致
+            )
+
+        # 可学习的双模态融合权重（如果同时使用图和指纹）
+        if self.use_graph and self.use_fingerprint:
+            # 初始权重：图0.1，指纹0.05（保守起步，避免破坏已有性能）
+            self.fusion_weights = nn.Parameter(torch.tensor([0.1, 0.05]))
+        elif self.use_graph:
+            self.fusion_weights = nn.Parameter(torch.tensor([0.1]))
+        elif self.use_fingerprint:
+            self.fusion_weights = nn.Parameter(torch.tensor([0.05]))
+
         self.word_embedding = nn.Embedding(vocab_size, self.input_dims)
         
         if self.num_props:
@@ -190,39 +271,58 @@ class TransformerNetModel(nn.Module):
             raise NotImplementedError
 
 
-    def forward(self, x, timesteps, graph_ids=None):
+    def forward(self, x, timesteps, graph_ids=None, fp_embs=None):
         """
         Apply the model to an input batch.
         :param x: an [N x C x ...] Tensor of inputs.
         :param timesteps: a 1-D batch of timesteps.
         :param graph_ids: molecular indices used to retrieve graph embeddings (optional)
+        :param fp_embs: molecular fingerprints (ECFP) [B, fp_dim] (optional)
         :return: an [N x C x ...] Tensor of outputs.
         """
         emb_t = self.time_embed(timestep_embedding(timesteps, self.hidden_t_dim))
-        
+
         if self.input_dims != self.hidden_size:
             emb_x = self.input_up_proj(x)
         else:
             emb_x = x
-        
+
         seq_length = x.size(1)
         position_ids = self.position_ids[:, : seq_length]
-        
-        # ====== 修改：用Cross-Attention融合图信息 ======
+
+        # ====== 修改：用Cross-Attention融合图信息和指纹信息 ======
         emb_inputs = self.position_embeddings(position_ids) + emb_x + emb_t.unsqueeze(1).expand(-1, seq_length, -1)
         emb_inputs = self.LayerNorm(emb_inputs)
-        
+
+        # 双模态融合：图 + 指纹
+        graph_info = None
+        fp_info = None
+
         if self.use_graph and graph_ids is not None:
             # 获取图嵌入
             graph_emb = self.graph_embeddings[graph_ids]  # [B, graph_dim]
-            
-            # Cross-attention融合（不破坏原始嵌入）
+            # Cross-attention融合
             graph_info = self.graph_fusion(emb_inputs, graph_emb)  # [B, L, D]
-            
-            # 残差连接（关键！保持原始文本信息）
-            # 使用小权重开始，让模型逐渐学习融合强度
-            emb_inputs = emb_inputs + 0.1 * graph_info
-        
+
+        if self.use_fingerprint and fp_embs is not None:
+            # 指纹已经是预计算的向量，直接融合
+            fp_info = self.fp_fusion(emb_inputs, fp_embs)  # [B, L, D]
+
+        # 可学习的加权融合
+        if self.use_graph and self.use_fingerprint:
+            if graph_info is not None and fp_info is not None:
+                # 双模态融合（权重可学习）
+                w_graph, w_fp = self.fusion_weights.abs()  # 保证非负
+                emb_inputs = emb_inputs + w_graph * graph_info + w_fp * fp_info
+            elif graph_info is not None:
+                emb_inputs = emb_inputs + self.fusion_weights[0].abs() * graph_info
+            elif fp_info is not None:
+                emb_inputs = emb_inputs + self.fusion_weights[1].abs() * fp_info
+        elif self.use_graph and graph_info is not None:
+            emb_inputs = emb_inputs + self.fusion_weights[0].abs() * graph_info
+        elif self.use_fingerprint and fp_info is not None:
+            emb_inputs = emb_inputs + self.fusion_weights[0].abs() * fp_info
+
         emb_inputs = self.dropout(emb_inputs)
         
         input_trans_hidden_states = self.input_transformers(emb_inputs).last_hidden_state
